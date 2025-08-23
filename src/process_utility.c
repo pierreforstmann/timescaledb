@@ -1534,28 +1534,37 @@ process_drop_hypertable_index(ProcessUtilityArgs *args, DropStmt *stmt)
 	{
 		List *object = lfirst(lc);
 		RangeVar *relation = makeRangeVarFromNameList(object);
-		Oid relid;
+		Oid ht_relid, index_relid;
 		Hypertable *ht;
 
 		if (NULL == relation)
 			continue;
 
-		relid = RangeVarGetRelid(relation, NoLock, true);
-		if (!OidIsValid(relid))
+		index_relid = RangeVarGetRelid(relation, NoLock, true);
+		if (!OidIsValid(index_relid))
 			continue;
 
-		relid = IndexGetRelation(relid, true);
-		if (!OidIsValid(relid))
+		ht_relid = IndexGetRelation(index_relid, true);
+		if (!OidIsValid(ht_relid))
 			continue;
 
-		ht = ts_hypertable_cache_get_entry(hcache, relid, CACHE_FLAG_MISSING_OK);
-		if (NULL != ht)
+		ht = ts_hypertable_cache_get_entry(hcache, ht_relid, CACHE_FLAG_MISSING_OK);
+		if (ht)
 		{
-			if (list_length(stmt->objects) != 1)
-				elog(ERROR, "cannot drop a hypertable index along with other objects");
+			List *chunk_indexes = ts_chunk_index_get_mappings(ht, index_relid);
+			ListCell *lc_index;
+			foreach (lc_index, chunk_indexes)
+			{
+				ChunkIndexMapping *mapping = lfirst(lc_index);
+				Oid chunk_relid = mapping->indexoid;
+				char *schema_name = get_namespace_name(get_rel_namespace(chunk_relid));
+				char *index_name = get_rel_name(chunk_relid);
+				stmt->objects =
+					lappend(stmt->objects,
+							list_make2(makeString(schema_name), makeString(index_name)));
+			}
 		}
 	}
-
 	ts_cache_release(&hcache);
 }
 
@@ -2238,17 +2247,9 @@ process_rename_index(ProcessUtilityArgs *args, Cache *hcache, Oid relid, RenameS
 		return;
 
 	ht = ts_hypertable_cache_get_entry(hcache, tablerelid, CACHE_FLAG_MISSING_OK);
-
-	if (NULL != ht)
+	if (ht)
 	{
-		ts_chunk_index_rename_parent(ht, relid, stmt->newname);
-	}
-	else
-	{
-		Chunk *chunk = ts_chunk_get_by_relid(tablerelid, false);
-
-		if (NULL != chunk)
-			ts_chunk_index_rename(chunk, relid, stmt->newname);
+		ts_chunk_index_rename(ht, relid, stmt->newname);
 	}
 }
 
@@ -5210,9 +5211,7 @@ process_drop_constraint_on_chunk(Hypertable *ht, Oid chunk_relid, void *arg)
 
 	/* drop both metadata and table; sql_drop won't be called recursively */
 	ts_chunk_constraint_delete_by_hypertable_constraint_name(chunk->fd.id,
-															 hypertable_constraint_name,
-															 true,
-															 true);
+															 hypertable_constraint_name);
 }
 
 static void
@@ -5244,20 +5243,8 @@ process_drop_table_constraint(EventTriggerDropObject *obj)
 		bool found = ts_chunk_get_id(constraint->schema, constraint->table, &chunk_id, true);
 
 		if (found)
-			ts_chunk_constraint_delete_by_constraint_name(chunk_id,
-														  constraint->constraint_name,
-														  true,
-														  false);
+			ts_chunk_constraint_delete_by_constraint_name(chunk_id, constraint->constraint_name);
 	}
-}
-
-static void
-process_drop_index(EventTriggerDropObject *obj)
-{
-	EventTriggerDropRelation *index = (EventTriggerDropRelation *) obj;
-
-	Assert(obj->type == EVENT_TRIGGER_DROP_INDEX);
-	ts_chunk_index_delete_by_name(index->schema, index->name, true);
 }
 
 static void
@@ -5345,9 +5332,6 @@ process_ddl_sql_drop(EventTriggerDropObject *obj)
 		case EVENT_TRIGGER_DROP_TABLE_CONSTRAINT:
 			process_drop_table_constraint(obj);
 			break;
-		case EVENT_TRIGGER_DROP_INDEX:
-			process_drop_index(obj);
-			break;
 		case EVENT_TRIGGER_DROP_TABLE:
 			process_drop_table(obj);
 			break;
@@ -5362,6 +5346,7 @@ process_ddl_sql_drop(EventTriggerDropObject *obj)
 			break;
 		case EVENT_TRIGGER_DROP_FOREIGN_TABLE:
 		case EVENT_TRIGGER_DROP_FOREIGN_SERVER:
+		case EVENT_TRIGGER_DROP_INDEX:
 			break;
 	}
 }
